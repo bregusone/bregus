@@ -19,12 +19,16 @@ class User(Base):
     )
 
     pets: Mapped[list["Pet"]] = relationship(
+        "Pet",
         back_populates="owner",
         cascade="all, delete-orphan",
         foreign_keys="Pet.user_id",
+        primaryjoin="User.id == Pet.user_id",
     )
     active_pet: Mapped[Optional["Pet"]] = relationship(
+        "Pet",
         foreign_keys=[active_pet_id],
+        primaryjoin="User.active_pet_id == Pet.id",
         post_update=True,
         uselist=False,
     )
@@ -40,8 +44,10 @@ class Pet(Base):
     birth_date: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     owner: Mapped[User] = relationship(
+        "User",
         back_populates="pets",
         foreign_keys=[user_id],
+        primaryjoin="User.id == Pet.user_id",
     )
     entries: Mapped[list["Entry"]] = relationship(
         back_populates="pet", cascade="all, delete-orphan"
