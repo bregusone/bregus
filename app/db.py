@@ -43,3 +43,5 @@ async def init_db() -> None:
         await conn.run_sync(Base.metadata.create_all)
 
 
+
+

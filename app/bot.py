@@ -28,6 +28,7 @@ from .keyboards import (
 )
 from .models import User, Pet, Entry, Attachment
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.client.default import DefaultBotProperties
 
 
 class AddPetStates(StatesGroup):
@@ -1279,7 +1280,10 @@ async def main() -> None:
     settings = load_settings()
     await init_db()
 
-    bot = Bot(settings.bot.token, parse_mode="HTML")
+    bot = Bot(
+        settings.bot.token,
+        default=DefaultBotProperties(parse_mode="HTML"),
+    )
     dp = Dispatcher()
     setup_routes(dp)
 
