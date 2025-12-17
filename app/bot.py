@@ -130,9 +130,15 @@ async def show_pets_menu(message: Message) -> None:
                 "Нажмите «➕ Добавить питомца», чтобы создать первую карту."
             )
         else:
-            active = user.active_pet
-            if active:
-                active_line = f"⭐ Активный: {active.name}"
+            active_name = None
+            if user.active_pet_id:
+                for pet in pets:
+                    if pet.id == user.active_pet_id:
+                        active_name = pet.name
+                        break
+
+            if active_name:
+                active_line = f"⭐ Активный: {active_name}"
             else:
                 active_line = "Активный питомец не выбран."
 
@@ -241,9 +247,15 @@ async def pets_list_callback(callback: CallbackQuery) -> None:
                 "Нажмите «➕ Добавить питомца», чтобы создать первую карту."
             )
         else:
-            active = user.active_pet
-            if active:
-                active_line = f"⭐ Активный: {active.name}"
+            active_name = None
+            if user.active_pet_id:
+                for pet in pets:
+                    if pet.id == user.active_pet_id:
+                        active_name = pet.name
+                        break
+
+            if active_name:
+                active_line = f"⭐ Активный: {active_name}"
             else:
                 active_line = "Активный питомец не выбран."
 

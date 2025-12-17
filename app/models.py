@@ -18,13 +18,6 @@ class User(Base):
         ForeignKey("pets.id"), nullable=True
     )
 
-    pets: Mapped[list["Pet"]] = relationship(
-        back_populates="owner", cascade="all, delete-orphan"
-    )
-    active_pet: Mapped[Optional["Pet"]] = relationship(
-        foreign_keys=[active_pet_id], post_update=True
-    )
-
 
 class Pet(Base):
     __tablename__ = "pets"
@@ -35,7 +28,6 @@ class Pet(Base):
     breed: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     birth_date: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
-    owner: Mapped[User] = relationship(back_populates="pets")
     entries: Mapped[list["Entry"]] = relationship(
         back_populates="pet", cascade="all, delete-orphan"
     )
