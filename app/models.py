@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import BigInteger, ForeignKey, String, Text, DateTime
+from sqlalchemy import BigInteger, ForeignKey, String, Text, DateTime, Integer, Boolean
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -61,6 +61,25 @@ class Attachment(Base):
     )
 
     entry: Mapped[Entry] = relationship(back_populates="attachments")
+
+
+class Reminder(Base):
+    __tablename__ = "reminders"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    pet_id: Mapped[int] = mapped_column(ForeignKey("pets.id"), index=True)
+    entry_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("entries.id"), nullable=True, index=True
+    )
+    title: Mapped[str] = mapped_column(String(128))
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    period_days: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    is_done: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    last_sent_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
 
 
 

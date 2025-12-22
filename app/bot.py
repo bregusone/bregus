@@ -26,7 +26,7 @@ from .keyboards import (
     entry_date_kb,
     summary_periods_kb,
 )
-from .models import User, Pet, Entry, Attachment
+from .models import User, Pet, Entry, Attachment, Reminder
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
 
@@ -46,6 +46,12 @@ class AddEntryStates(StatesGroup):
 
 class AttachFilesStates(StatesGroup):
     adding = State()
+
+
+class VaccineReminderStates(StatesGroup):
+    choosing_vaccine = State()
+    choosing_delay = State()
+    custom_delay = State()
 
 
 async def ensure_user(message: Message) -> User:
@@ -147,15 +153,19 @@ async def show_pets_menu(message: Message) -> None:
                 "Список питомцев ниже. Нажмите на питомца, чтобы открыть карточку."
             )
 
-        kb = pets_list_kb(
-            [
-                (
-                    pet.id,
-                    f"{'⭐ ' if user.active_pet_id == pet.id else ''}{pet.name}",
-                )
-                for pet in pets
-            ]
-        )
+        items: list[tuple[int, str]] = []
+        for pet in pets:
+            if pet.species == "cat":
+                icon = "🐱"
+            elif pet.species == "dog":
+                icon = "🐶"
+            else:
+                icon = "🐾"
+            prefix = "⭐ " if user.active_pet_id == pet.id else ""
+            title = f"{prefix}{icon} {pet.name}"
+            items.append((pet.id, title))
+
+        kb = pets_list_kb(items)
 
     await message.answer(text, reply_markup=kb)
 
@@ -264,15 +274,19 @@ async def pets_list_callback(callback: CallbackQuery) -> None:
                 "Список питомцев ниже. Нажмите на питомца, чтобы открыть карточку."
             )
 
-        kb = pets_list_kb(
-            [
-                (
-                    pet.id,
-                    f"{'⭐ ' if user.active_pet_id == pet.id else ''}{pet.name}",
-                )
-                for pet in pets
-            ]
-        )
+        items: list[tuple[int, str]] = []
+        for pet in pets:
+            if pet.species == "cat":
+                icon = "🐱"
+            elif pet.species == "dog":
+                icon = "🐶"
+            else:
+                icon = "🐾"
+            prefix = "⭐ " if user.active_pet_id == pet.id else ""
+            title = f"{prefix}{icon} {pet.name}"
+            items.append((pet.id, title))
+
+        kb = pets_list_kb(items)
 
     if callback.message:
         await callback.message.edit_text(text, reply_markup=kb)
@@ -314,7 +328,12 @@ async def pet_card_callback(callback: CallbackQuery) -> None:
             "dog": "Пёс",
             "other": "Другое",
         }
+        icon_map = {
+            "cat": "🐱",
+            "dog": "🐶",
+        }
         species = species_map.get(pet.species, pet.species)
+        species_icon = icon_map.get(pet.species, "🐾")
         age_line = "Возраст не указан."
         if pet.birth_date:
             # Грубый подсчёт возраста по годам
@@ -322,7 +341,7 @@ async def pet_card_callback(callback: CallbackQuery) -> None:
             age_line = f"Возраст: ~{years} г."
 
         text = (
-            f"🐾 <b>{pet.name}</b>\n"
+            f"{species_icon} <b>{pet.name}</b>\n"
             f"Вид: {species}\n"
             f"{age_line}"
         )
@@ -679,6 +698,16 @@ async def entry_text_message(message: Message, state: FSMContext) -> None:
         text="📎 Прикрепить файлы",
         callback_data=f"entry:attach:{entry.id}",
     )
+    if entry_type == "vaccine":
+        builder.button(
+            text="⏰ Напомнить о следующей прививке",
+            callback_data=f"vrem:start:{entry.id}",
+        )
+    elif entry_type == "meds":
+        builder.button(
+            text="💊 Это глистогонное: напомнить повтор через 10 дней",
+            callback_data=f"mrem:start:{entry.id}",
+        )
     builder.adjust(1)
 
     await message.answer(
@@ -690,6 +719,314 @@ async def entry_text_message(message: Message, state: FSMContext) -> None:
         "или сделать это позже через историю.",
         reply_markup=builder.as_markup(),
     )
+
+
+def build_vaccine_keyboard(species: str) -> InlineKeyboardBuilder:
+    """Возвращает клавиатуру с типовыми прививками для кошек/собак."""
+    builder = InlineKeyboardBuilder()
+    if species == "dog":
+        builder.button(
+            text="Бешенство", callback_data="vrem:vaccine:rabies"
+        )
+        builder.button(
+            text="Комплекс DHPPi", callback_data="vrem:vaccine:dhppi"
+        )
+        builder.button(
+            text="Лептоспироз", callback_data="vrem:vaccine:lepto"
+        )
+    elif species == "cat":
+        builder.button(
+            text="Бешенство", callback_data="vrem:vaccine:rabies"
+        )
+        builder.button(
+            text="Панлейкопения/ринотрахеит/калицивирус",
+            callback_data="vrem:vaccine:pcr",
+        )
+    builder.button(
+        text="Другая прививка", callback_data="vrem:vaccine:other"
+    )
+    builder.adjust(1)
+    return builder
+
+
+def build_delay_keyboard() -> InlineKeyboardBuilder:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Через 1 месяц", callback_data="vrem:delay:30")
+    builder.button(text="Через 3 месяца", callback_data="vrem:delay:90")
+    builder.button(text="Через 6 месяцев", callback_data="vrem:delay:180")
+    builder.button(text="Через 1 год", callback_data="vrem:delay:365")
+    builder.button(text="Ввести дни", callback_data="vrem:delay:custom")
+    builder.adjust(1)
+    return builder
+
+
+async def vaccine_reminder_start(callback: CallbackQuery, state: FSMContext) -> None:
+    """Старт мастера напоминания о прививке для конкретной записи."""
+    assert callback.data is not None
+    assert callback.from_user is not None
+    telegram_id = callback.from_user.id
+
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+    try:
+        entry_id = int(parts[2])
+    except ValueError:
+        await callback.answer("Не удалось определить запись", show_alert=True)
+        return
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(User).where(User.telegram_id == telegram_id)
+        )
+        user = result.scalar_one_or_none()
+        if not user:
+            await callback.answer("Сначала используйте /start", show_alert=True)
+            return
+
+        entry_result = await session.execute(
+            select(Entry)
+            .join(Pet, Entry.pet_id == Pet.id)
+            .where(Entry.id == entry_id, Pet.user_id == user.id)
+        )
+        entry = entry_result.scalar_one_or_none()
+        if not entry:
+            await callback.answer("Запись не найдена", show_alert=True)
+            return
+
+        pet_result = await session.execute(
+            select(Pet).where(Pet.id == entry.pet_id)
+        )
+        pet = pet_result.scalar_one_or_none()
+
+    if not pet:
+        await callback.answer("Питомец не найден", show_alert=True)
+        return
+
+    await state.set_state(VaccineReminderStates.choosing_vaccine)
+    await state.update_data(
+        entry_id=entry_id,
+        pet_id=pet.id,
+        pet_name=pet.name,
+        species=pet.species,
+    )
+
+    kb = build_vaccine_keyboard(pet.species)
+
+    if callback.message:
+        await callback.message.edit_text(
+            f"Для питомца <b>{pet.name}</b> выберите тип прививки:",
+            reply_markup=kb.as_markup(),
+        )
+    await callback.answer()
+
+
+async def vaccine_choose_vaccine(callback: CallbackQuery, state: FSMContext) -> None:
+    """Выбор конкретной прививки для напоминания."""
+    assert callback.data is not None
+
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+
+    slug = parts[2]
+    title_map = {
+        "rabies": "Прививка от бешенства",
+        "dhppi": "Комплекс DHPPi",
+        "lepto": "Прививка от лептоспироза",
+        "pcr": "Комплекс ПКР (панлейкопения/ринотрахеит/калицивирус)",
+        "other": "Прививка (другая)",
+    }
+    title = title_map.get(slug, "Прививка")
+
+    await state.update_data(reminder_title=title)
+    await state.set_state(VaccineReminderStates.choosing_delay)
+
+    kb = build_delay_keyboard()
+    if callback.message:
+        await callback.message.edit_text(
+            f"{title}\n\n"
+            "Через сколько времени напомнить о следующей прививке?",
+            reply_markup=kb.as_markup(),
+        )
+    await callback.answer()
+
+
+async def vaccine_choose_delay(callback: CallbackQuery, state: FSMContext) -> None:
+    """Выбор фиксированного интервала или запроса ввода дней."""
+    assert callback.data is not None
+
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+
+    value = parts[2]
+    if value == "custom":
+        await state.set_state(VaccineReminderStates.custom_delay)
+        if callback.message:
+            await callback.message.edit_text(
+                "Введите через сколько дней напомнить (целое число):"
+            )
+        await callback.answer()
+        return
+
+    try:
+        days = int(value)
+    except ValueError:
+        await callback.answer("Некорректное значение", show_alert=True)
+        return
+
+    await _create_vaccine_reminder(callback, state, days)
+
+
+async def vaccine_custom_delay_message(message: Message, state: FSMContext) -> None:
+    """Парсинг введённого пользователем количества дней до напоминания."""
+    text = (message.text or "").strip()
+    try:
+        days = int(text)
+    except ValueError:
+        await message.answer("Нужно ввести целое число дней, например 30.")
+        return
+
+    if days <= 0:
+        await message.answer("Число дней должно быть больше нуля.")
+        return
+
+    await _create_vaccine_reminder(message, state, days)
+
+
+async def _create_vaccine_reminder(
+    event: Message | CallbackQuery,
+    state: FSMContext,
+    days: int,
+) -> None:
+    """Фактическое создание напоминания в БД."""
+    data = await state.get_data()
+    entry_id = data.get("entry_id")
+    pet_id = data.get("pet_id")
+    pet_name = data.get("pet_name")
+    title = data.get("reminder_title", "Прививка")
+
+    if isinstance(event, Message):
+        assert event.from_user is not None
+        telegram_id = event.from_user.id
+    else:
+        assert event.from_user is not None
+        telegram_id = event.from_user.id
+
+    due_at = datetime.utcnow() + timedelta(days=days)
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(User).where(User.telegram_id == telegram_id)
+        )
+        user = result.scalar_one_or_none()
+        if not user:
+            user = User(telegram_id=telegram_id)
+            session.add(user)
+            await session.commit()
+            await session.refresh(user)
+
+        reminder = Reminder(
+            user_id=user.id,
+            pet_id=pet_id,
+            entry_id=entry_id,
+            title=title,
+            due_at=due_at,
+            period_days=None,
+            is_done=False,
+        )
+        session.add(reminder)
+        await session.commit()
+
+    await state.clear()
+
+    due_str = due_at.strftime("%Y-%m-%d")
+    text = (
+        f"Напоминание создано ✅\n\n"
+        f"Питомец: <b>{pet_name}</b>\n"
+        f"Событие: {title}\n"
+        f"Дата напоминания: {due_str}"
+    )
+
+    if isinstance(event, Message):
+        await event.answer(text, reply_markup=main_menu_kb())
+    else:
+        if event.message:
+            await event.message.edit_text(text, reply_markup=None)
+        await event.answer()
+
+
+async def meds_dewormer_reminder_start(callback: CallbackQuery) -> None:
+    """Создаёт напоминание о повторной даче глистогонного через 10 дней."""
+    assert callback.data is not None
+    assert callback.from_user is not None
+    telegram_id = callback.from_user.id
+
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+
+    try:
+        entry_id = int(parts[2])
+    except ValueError:
+        await callback.answer("Не удалось определить запись", show_alert=True)
+        return
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(User).where(User.telegram_id == telegram_id)
+        )
+        user = result.scalar_one_or_none()
+        if not user:
+            await callback.answer("Сначала используйте /start", show_alert=True)
+            return
+
+        entry_result = await session.execute(
+            select(Entry)
+            .join(Pet, Entry.pet_id == Pet.id)
+            .where(Entry.id == entry_id, Pet.user_id == user.id)
+        )
+        entry = entry_result.scalar_one_or_none()
+        if not entry:
+            await callback.answer("Запись не найдена", show_alert=True)
+            return
+
+        pet_result = await session.execute(
+            select(Pet).where(Pet.id == entry.pet_id)
+        )
+        pet = pet_result.scalar_one_or_none()
+        if not pet:
+            await callback.answer("Питомец не найден", show_alert=True)
+            return
+
+        # повтор через 10 дней от даты приёма лекарства
+        due_at = entry.date + timedelta(days=10)
+
+        reminder = Reminder(
+            user_id=user.id,
+            pet_id=pet.id,
+            entry_id=entry.id,
+            title="Повтор глистогонного",
+            due_at=due_at,
+            period_days=None,
+            is_done=False,
+        )
+        session.add(reminder)
+        await session.commit()
+
+    due_str = due_at.strftime("%Y-%m-%d")
+    if callback.message:
+        await callback.message.edit_text(
+            f"Напоминание о повторной даче глистогонного создано ✅\n\n"
+            f"Питомец: <b>{pet.name}</b>\n"
+            f"Дата напоминания: {due_str}",
+        )
+    await callback.answer()
 
 
 async def entry_attach_start(callback: CallbackQuery, state: FSMContext) -> None:
@@ -1203,6 +1540,31 @@ def setup_routes(dp: Dispatcher) -> None:
         AddEntryStates.text,
     )
 
+    # Напоминания о прививках
+    dp.callback_query.register(
+        vaccine_reminder_start,
+        F.data.startswith("vrem:start:"),
+    )
+    dp.callback_query.register(
+        vaccine_choose_vaccine,
+        F.data.startswith("vrem:vaccine:"),
+        VaccineReminderStates.choosing_vaccine,
+    )
+    dp.callback_query.register(
+        vaccine_choose_delay,
+        F.data.startswith("vrem:delay:"),
+        VaccineReminderStates.choosing_delay,
+    )
+    dp.message.register(
+        vaccine_custom_delay_message,
+        VaccineReminderStates.custom_delay,
+    )
+
+    dp.callback_query.register(
+        meds_dewormer_reminder_start,
+        F.data.startswith("mrem:start:"),
+    )
+
     # Прикрепление файлов к записи
     dp.callback_query.register(
         entry_attach_start,
@@ -1298,6 +1660,48 @@ async def main() -> None:
     )
     dp = Dispatcher()
     setup_routes(dp)
+
+    async def reminders_worker() -> None:
+        """Периодически проверяет напоминания и отправляет их пользователям."""
+        while True:
+            now = datetime.utcnow()
+            async with get_session() as session:
+                result = await session.execute(
+                    select(Reminder, Pet, User)
+                    .join(Pet, Reminder.pet_id == Pet.id)
+                    .join(User, Reminder.user_id == User.id)
+                    .where(
+                        Reminder.is_done.is_(False),
+                        Reminder.due_at <= now,
+                    )
+                )
+                rows = result.all()
+
+                for reminder, pet, user in rows:
+                    try:
+                        await bot.send_message(
+                            chat_id=user.telegram_id,
+                            text=(
+                                f"⏰ Напоминание о прививке\n\n"
+                                f"Питомец: <b>{pet.name}</b>\n"
+                                f"Событие: {reminder.title}\n"
+                                f"Дата: {reminder.due_at.strftime('%Y-%m-%d')}"
+                            ),
+                        )
+                    except Exception:
+                        # В MVP просто помечаем как выполненное даже при ошибке отправки
+                        pass
+
+                    reminder.is_done = True
+                    reminder.last_sent_at = now
+                    session.add(reminder)
+
+                await session.commit()
+
+            await asyncio.sleep(60)
+
+    # запускаем воркер напоминаний параллельно с polling
+    asyncio.create_task(reminders_worker())
 
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
