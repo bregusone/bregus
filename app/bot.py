@@ -1,16 +1,38 @@
 import asyncio
 from contextlib import suppress
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery
+from aiogram.exceptions import TelegramAPIError
 from sqlalchemy import select
 
 from .config import load_settings
 from .db import init_db, get_session
+from .logging_config import setup_logging, get_logger
+from .constants import (
+    EntryType,
+    PetSpecies,
+    MAX_PET_NAME_LENGTH,
+    MAX_BREED_LENGTH,
+    MAX_ENTRY_TEXT_LENGTH,
+    REMINDERS_CHECK_INTERVAL,
+    ENTRY_TYPE_NAMES,
+    SPECIES_NAMES,
+    SPECIES_ICONS,
+)
+from .validators import (
+    validate_pet_name,
+    validate_breed,
+    validate_entry_text,
+    validate_date,
+    ValidationError,
+)
+
+logger = get_logger(__name__)
 from .keyboards import (
     main_menu_kb,
     MAIN_MENU_BUTTON_PETS,
@@ -155,11 +177,9 @@ async def show_pets_menu(message: Message) -> None:
 
         items: list[tuple[int, str]] = []
         for pet in pets:
-            if pet.species == "cat":
-                icon = "🐱"
-            elif pet.species == "dog":
-                icon = "🐶"
-            else:
+            try:
+                icon = SPECIES_ICONS[PetSpecies(pet.species)]
+            except (ValueError, KeyError):
                 icon = "🐾"
             prefix = "⭐ " if user.active_pet_id == pet.id else ""
             title = f"{prefix}{icon} {pet.name}"
@@ -276,11 +296,9 @@ async def pets_list_callback(callback: CallbackQuery) -> None:
 
         items: list[tuple[int, str]] = []
         for pet in pets:
-            if pet.species == "cat":
-                icon = "🐱"
-            elif pet.species == "dog":
-                icon = "🐶"
-            else:
+            try:
+                icon = SPECIES_ICONS[PetSpecies(pet.species)]
+            except (ValueError, KeyError):
                 icon = "🐾"
             prefix = "⭐ " if user.active_pet_id == pet.id else ""
             title = f"{prefix}{icon} {pet.name}"
@@ -323,21 +341,17 @@ async def pet_card_callback(callback: CallbackQuery) -> None:
             await callback.answer("Питомец не найден", show_alert=True)
             return
 
-        species_map = {
-            "cat": "Кот",
-            "dog": "Пёс",
-            "other": "Другое",
-        }
-        icon_map = {
-            "cat": "🐱",
-            "dog": "🐶",
-        }
-        species = species_map.get(pet.species, pet.species)
-        species_icon = icon_map.get(pet.species, "🐾")
+        try:
+            species_enum = PetSpecies(pet.species)
+            species = SPECIES_NAMES[species_enum]
+            species_icon = SPECIES_ICONS[species_enum]
+        except (ValueError, KeyError):
+            species = pet.species
+            species_icon = "🐾"
         age_line = "Возраст не указан."
         if pet.birth_date:
             # Грубый подсчёт возраста по годам
-            years = max(0, datetime.utcnow().year - pet.birth_date.year)
+            years = max(0, datetime.now(timezone.utc).year - pet.birth_date.year)
             age_line = f"Возраст: ~{years} г."
 
         text = (
@@ -413,9 +427,15 @@ async def pets_add_start(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 async def pets_add_name(message: Message, state: FSMContext) -> None:
-    name = (message.text or "").strip()
-    if not name:
-        await message.answer("Имя не может быть пустым. Попробуйте ещё раз.")
+    try:
+        name = validate_pet_name(message.text or "")
+    except ValidationError as e:
+        await message.answer(str(e))
+        logger.warning(f"Невалидное имя питомца от пользователя {message.from_user.id}: {message.text}")
+        return
+    except Exception as e:
+        logger.exception(f"Ошибка при валидации имени питомца: {e}")
+        await message.answer("Произошла ошибка. Попробуйте ещё раз.")
         return
 
     await state.update_data(name=name)
@@ -451,11 +471,15 @@ async def pets_add_breed_skip(callback: CallbackQuery, state: FSMContext) -> Non
 
 
 async def pets_add_breed(message: Message, state: FSMContext) -> None:
-    breed = (message.text or "").strip()
-    if not breed:
-        await message.answer(
-            "Порода не может быть пустой. Введите текст или нажмите «➡ Пропустить»."
-        )
+    try:
+        breed = validate_breed(message.text)
+    except ValidationError as e:
+        await message.answer(str(e))
+        logger.warning(f"Невалидная порода от пользователя {message.from_user.id}: {message.text}")
+        return
+    except Exception as e:
+        logger.exception(f"Ошибка при валидации породы: {e}")
+        await message.answer("Произошла ошибка. Попробуйте ещё раз.")
         return
 
     await state.update_data(breed=breed)
@@ -560,7 +584,7 @@ async def entry_date_callback(callback: CallbackQuery, state: FSMContext) -> Non
         return
     choice = parts[2]
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     if choice == "today":
         chosen_date = datetime(now.year, now.month, now.day)
         await state.update_data(date=chosen_date.isoformat())
@@ -593,16 +617,17 @@ async def entry_date_callback(callback: CallbackQuery, state: FSMContext) -> Non
 
 async def entry_custom_date_message(message: Message, state: FSMContext) -> None:
     """Парсинг введённой пользователем даты."""
-    text = (message.text or "").strip()
     try:
-        dt = datetime.strptime(text, "%Y-%m-%d")
-    except ValueError:
-        await message.answer(
-            "Не удалось распознать дату. Введите в формате YYYY-MM-DD, например 2025-12-01."
-        )
+        chosen_date = validate_date(message.text or "")
+    except ValidationError as e:
+        await message.answer(str(e))
+        logger.warning(f"Невалидная дата от пользователя {message.from_user.id}: {message.text}")
+        return
+    except Exception as e:
+        logger.exception(f"Ошибка при валидации даты: {e}")
+        await message.answer("Произошла ошибка. Попробуйте ещё раз.")
         return
 
-    chosen_date = datetime(dt.year, dt.month, dt.day)
     await state.update_data(date=chosen_date.isoformat())
     await state.set_state(AddEntryStates.text)
     await message.answer("Введите текст записи (описание симптома, визита и т.п.):")
@@ -610,9 +635,15 @@ async def entry_custom_date_message(message: Message, state: FSMContext) -> None
 
 async def entry_text_message(message: Message, state: FSMContext) -> None:
     """Финальный шаг мастера: сохраняем запись в БД."""
-    text = (message.text or "").strip()
-    if not text:
-        await message.answer("Текст записи не может быть пустым. Введите описание.")
+    try:
+        text = validate_entry_text(message.text or "")
+    except ValidationError as e:
+        await message.answer(str(e))
+        logger.warning(f"Невалидный текст записи от пользователя {message.from_user.id}")
+        return
+    except Exception as e:
+        logger.exception(f"Ошибка при валидации текста записи: {e}")
+        await message.answer("Произошла ошибка. Попробуйте ещё раз.")
         return
 
     data = await state.get_data()
@@ -683,14 +714,12 @@ async def entry_text_message(message: Message, state: FSMContext) -> None:
 
     await state.clear()
 
-    type_names = {
-        "symptom": "Симптом",
-        "visit": "Визит",
-        "vaccine": "Прививка",
-        "meds": "Лекарство",
-        "other": "Другое",
-    }
-    type_title = type_names.get(entry_type, entry_type)
+    # Используем константы для названий типов
+    try:
+        entry_type_enum = EntryType(entry_type)
+        type_title = ENTRY_TYPE_NAMES[entry_type_enum].replace("🤒 ", "").replace("🏥 ", "").replace("💉 ", "").replace("💊 ", "").replace("📝 ", "")
+    except (ValueError, KeyError):
+        type_title = entry_type
     date_str = date.strftime("%Y-%m-%d")
 
     builder = InlineKeyboardBuilder()
@@ -917,7 +946,7 @@ async def _create_vaccine_reminder(
         assert event.from_user is not None
         telegram_id = event.from_user.id
 
-    due_at = datetime.utcnow() + timedelta(days=days)
+    due_at = datetime.now(timezone.utc) + timedelta(days=days)
 
     async with get_session() as session:
         result = await session.execute(
@@ -1184,18 +1213,13 @@ async def show_history(message: Message) -> None:
         )
         return
 
-    type_names = {
-        "symptom": "🤒 Симптом",
-        "visit": "🏥 Визит",
-        "vaccine": "💉 Прививка",
-        "meds": "💊 Лекарство",
-        "other": "📝 Другое",
-    }
-
     builder = InlineKeyboardBuilder()
     for e in entries:
         date_str = e.date.strftime("%Y-%m-%d")
-        type_title = type_names.get(e.type, e.type)
+        try:
+            type_title = ENTRY_TYPE_NAMES[EntryType(e.type)]
+        except (ValueError, KeyError):
+            type_title = e.type
         text_preview = e.text.strip().replace("\n", " ")
         if len(text_preview) > 40:
             text_preview = text_preview[:37] + "..."
@@ -1252,14 +1276,10 @@ async def entry_view_callback(callback: CallbackQuery) -> None:
         )
         attachments = list(attachments_result.scalars().all())
 
-    type_names = {
-        "symptom": "🤒 Симптом",
-        "visit": "🏥 Визит",
-        "vaccine": "💉 Прививка",
-        "meds": "💊 Лекарство",
-        "other": "📝 Другое",
-    }
-    type_title = type_names.get(entry.type, entry.type)
+    try:
+        type_title = ENTRY_TYPE_NAMES[EntryType(entry.type)]
+    except (ValueError, KeyError):
+        type_title = entry.type
     date_str = entry.date.strftime("%Y-%m-%d")
     files_count = len(attachments)
 
@@ -1423,7 +1443,7 @@ async def summary_period_callback(callback: CallbackQuery) -> None:
         await callback.answer("Некорректный период", show_alert=True)
         return
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     start_date = now - timedelta(days=days)
 
     async with get_session() as session:
@@ -1473,17 +1493,13 @@ async def summary_period_callback(callback: CallbackQuery) -> None:
             f"За последние {days} дн. для питомца <b>{pet.name}</b> записей нет."
         )
     else:
-        type_names = {
-            "symptom": "🤒 Симптом",
-            "visit": "🏥 Визит",
-            "vaccine": "💉 Прививка",
-            "meds": "💊 Лекарство",
-            "other": "📝 Другое",
-        }
         lines: list[str] = []
         for e in entries:
             date_str = e.date.strftime("%Y-%m-%d")
-            type_title = type_names.get(e.type, e.type)
+            try:
+                type_title = ENTRY_TYPE_NAMES[EntryType(e.type)]
+            except (ValueError, KeyError):
+                type_title = e.type
             lines.append(f"{date_str} · {type_title}: {e.text}")
 
         body = "\n".join(lines)
@@ -1651,8 +1667,23 @@ def setup_routes(dp: Dispatcher) -> None:
 
 
 async def main() -> None:
-    settings = load_settings()
-    await init_db()
+    # Настройка логирования
+    setup_logging()
+    logger.info("Запуск бота Pet Health Diary")
+    
+    try:
+        settings = load_settings()
+        logger.info("Настройки загружены")
+    except Exception as e:
+        logger.critical(f"Ошибка загрузки настроек: {e}")
+        raise
+    
+    try:
+        await init_db()
+        logger.info("База данных инициализирована")
+    except Exception as e:
+        logger.critical(f"Ошибка инициализации БД: {e}")
+        raise
 
     bot = Bot(
         settings.bot.token,
@@ -1660,45 +1691,66 @@ async def main() -> None:
     )
     dp = Dispatcher()
     setup_routes(dp)
+    logger.info("Роуты зарегистрированы")
 
     async def reminders_worker() -> None:
         """Периодически проверяет напоминания и отправляет их пользователям."""
+        logger.info("Запущен воркер напоминаний")
         while True:
-            now = datetime.utcnow()
-            async with get_session() as session:
-                result = await session.execute(
-                    select(Reminder, Pet, User)
-                    .join(Pet, Reminder.pet_id == Pet.id)
-                    .join(User, Reminder.user_id == User.id)
-                    .where(
-                        Reminder.is_done.is_(False),
-                        Reminder.due_at <= now,
-                    )
-                )
-                rows = result.all()
-
-                for reminder, pet, user in rows:
-                    try:
-                        await bot.send_message(
-                            chat_id=user.telegram_id,
-                            text=(
-                                f"⏰ Напоминание о прививке\n\n"
-                                f"Питомец: <b>{pet.name}</b>\n"
-                                f"Событие: {reminder.title}\n"
-                                f"Дата: {reminder.due_at.strftime('%Y-%m-%d')}"
-                            ),
+            try:
+                now = datetime.now(timezone.utc)
+                async with get_session() as session:
+                    result = await session.execute(
+                        select(Reminder, Pet, User)
+                        .join(Pet, Reminder.pet_id == Pet.id)
+                        .join(User, Reminder.user_id == User.id)
+                        .where(
+                            Reminder.is_done.is_(False),
+                            Reminder.due_at <= now,
                         )
-                    except Exception:
-                        # В MVP просто помечаем как выполненное даже при ошибке отправки
-                        pass
+                    )
+                    rows = result.all()
 
-                    reminder.is_done = True
-                    reminder.last_sent_at = now
-                    session.add(reminder)
+                    for reminder, pet, user in rows:
+                        try:
+                            await bot.send_message(
+                                chat_id=user.telegram_id,
+                                text=(
+                                    f"⏰ Напоминание о прививке\n\n"
+                                    f"Питомец: <b>{pet.name}</b>\n"
+                                    f"Событие: {reminder.title}\n"
+                                    f"Дата: {reminder.due_at.strftime('%Y-%m-%d')}"
+                                ),
+                            )
+                            logger.info(
+                                f"Отправлено напоминание пользователю {user.telegram_id} "
+                                f"для питомца {pet.name}"
+                            )
+                            reminder.is_done = True
+                            reminder.last_sent_at = now
+                        except TelegramAPIError as e:
+                            logger.error(
+                                f"Ошибка Telegram API при отправке напоминания "
+                                f"пользователю {user.telegram_id}: {e}"
+                            )
+                            # Не помечаем как выполненное при ошибке API
+                            continue
+                        except Exception as e:
+                            logger.exception(
+                                f"Неожиданная ошибка при отправке напоминания "
+                                f"пользователю {user.telegram_id}: {e}"
+                            )
+                            # Помечаем как выполненное, чтобы не зациклиться
+                            reminder.is_done = True
+                            reminder.last_sent_at = now
 
-                await session.commit()
+                        session.add(reminder)
 
-            await asyncio.sleep(60)
+                    await session.commit()
+            except Exception as e:
+                logger.exception(f"Ошибка в воркере напоминаний: {e}")
+
+            await asyncio.sleep(REMINDERS_CHECK_INTERVAL)
 
     # запускаем воркер напоминаний параллельно с polling
     asyncio.create_task(reminders_worker())

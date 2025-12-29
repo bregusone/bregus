@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import BigInteger, ForeignKey, String, Text, DateTime, Integer, Boolean
@@ -7,12 +7,17 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .db import Base
 
 
+def utc_now() -> datetime:
+    """Возвращает текущее время в UTC."""
+    return datetime.now(timezone.utc)
+
+
 class User(Base):
     __tablename__ = "users"
 
     telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
     registered_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=datetime.utcnow
+        DateTime(timezone=True), default=utc_now
     )
     active_pet_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("pets.id"), nullable=True
@@ -39,7 +44,7 @@ class Entry(Base):
     pet_id: Mapped[int] = mapped_column(ForeignKey("pets.id"), index=True)
     type: Mapped[str] = mapped_column(String(16))  # symptom/visit/vaccine/meds/other
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=datetime.utcnow, index=True
+        DateTime(timezone=True), default=utc_now, index=True
     )
     date: Mapped[datetime] = mapped_column(DateTime, index=True)
     text: Mapped[str] = mapped_column(Text)
