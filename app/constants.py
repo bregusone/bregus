@@ -62,3 +62,5 @@ SPECIES_ICONS = {
     PetSpecies.OTHER: "🐾",
 }
 
+
+
